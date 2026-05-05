@@ -1,5 +1,7 @@
 __pycache__/
 .venv/
+checkpoints/
+*.pt
 
 .env
 
@@ -36,7 +38,6 @@ errors
 chroma
 new_experimental/
 agent_workspace
-.pt
 Accounting Assistant_state.json
 Unit Testing Agent_state.json
 sec_agent
@@ -427,4 +428,3 @@ flycheck_*.el
 
 # network security
 /network-security.data
-

@@ -1,159 +1,173 @@
 # Training QwenRecurrentModel
 
-This directory contains training scripts for fine-tuning the converted `QwenRecurrentModel` (Qwen3-4B restructured into Mythos RDT topology).
+This directory contains the Qwen-to-Mythos fine-tuning path for `QwenRecurrentModel`, a Qwen3-4B checkpoint restructured into a Recurrent-Depth Transformer topology.
 
 ## Prerequisites
 
-- **GPU:** Minimum 24GB VRAM (A100/H100 recommended for multi-GPU FSDP)
-- **Python 3.12+** with dependencies from `pyproject.toml`
-- **Extra:** `pip install loguru` (used by training scripts)
+- **GPU:** 32GB VRAM is the practical single-GPU floor for full differential fine-tuning at `seq_len=512`; more VRAM is needed for longer contexts.
+- **Python:** 3.12+ with dependencies from `pyproject.toml`.
+- **Extra:** `loguru` for training logs.
 
 ```bash
-pip install -e ".[training]" loguru
+pip install -e . loguru
 ```
 
-## Model Overview
+## Converted Model
 
-The converted checkpoint `converted_qwen3_4b_recurrent.pt` contains:
+Create the recurrent checkpoint with:
 
-| Component | Params | Notes |
-|---|---|---|
-| Embedding + Head (tied) | ~389M | From Qwen3-4B, do not touch aggressively |
-| 5 unique QwenTransformerBlocks | ~505M | Averaged from 36 Qwen3 layers |
-| LTIInjection | ~5K | Random init, needs training |
-| ACTHalting | ~2.6K | Random init, needs training |
-| LoRAAdapter | ~143K | Zero init, needs training |
-| **Total** | **~894M** | ~505M unique layer params |
+```bash
+python scripts/convert_qwen_to_recurrent.py \
+  --qwen-path Qwen/Qwen3-4B \
+  --output converted_qwen3_4b_recurrent_v3.pt
+```
 
-## Two-Phase Fine-Tuning Strategy
+The converted model uses a coherent contiguous mapping:
 
-The model's recurrent modules (LTI/ACT/LoRA) are randomly initialized. Training them together with the averaged Qwen backbone at the same learning rate causes gradient interference. Use two phases:
+| Component | Source layers | Notes |
+|---|---:|---|
+| Prelude | Qwen L0-L3 | Copied verbatim |
+| Recurrent stack | Qwen L4-L7 | Four blocks looped seven times |
+| Coda | Qwen L32-L35 | Copied verbatim |
+| Projection LoRAs | Qwen L4-L31 deltas | Rank-SVD initialization per `(loop, block, projection)` |
 
-### Phase 1: Recurrent-Module Warmup
+The alignment is `P + K*T = N - E`: with `N=36`, `P=4`, `K=4`, `T=7`, and `E=4`, the recurrent span covers the 28 middle Qwen layers. Loop 0 uses zero LoRA deltas, while loops 1-6 approximate Qwen L8-L31 with low-rank projection updates.
 
-Trains only the new recurrent modules (~153K params) while freezing the Qwen backbone.
+Approximate parameter layout:
+
+| Component | Params | Trainability |
+|---|---:|---|
+| Embedding + tied head | ~389M | Phase 2 only |
+| 12 QwenTransformerBlocks | ~1.21B | Frozen in Phase 1, trained in Phase 2 |
+| Projection LoRAs | ~25.7M | Phase 1 and Phase 2 |
+| LTI / ACT / recurrent norm | <1M | Phase 1 and Phase 2 |
+| **Total** | **~1.63B** | RMSNorm weights remain frozen in Phase 2 |
+
+## Fine-Tuning Plan
+
+Use two phases. Phase 1 is a stability warmup for the new recurrent components. Phase 2 is a full-parameter recovery run with differential learning rates.
+
+### Phase 1: Recurrent Warmup
+
+Phase 1 freezes the copied Qwen backbone and trains only LTI, ACT, recurrent norm, and projection LoRAs.
 
 ```bash
 python training/qwen_recurrent_finetune.py \
   --phase recurrent_only \
-  --converted-ckpt converted_qwen3_4b_recurrent.pt \
-  --steps 10000 \
-  --seq-len 1024 \
-  --micro-batch 4 \
+  --converted-ckpt converted_qwen3_4b_recurrent_v3.pt \
+  --steps 1000 \
+  --seq-len 512 \
+  --micro-batch 1 \
+  --grad-accum 4 \
   --lr 1e-4 \
-  --warmup 500 \
+  --warmup 50 \
   --dataset roneneldan/TinyStories \
-  --ckpt-dir checkpoints/phase1
+  --ckpt-dir checkpoints/qwen_recurrent_phase1 \
+  --ckpt-every 250 \
+  --log-every 10 \
+  --num-workers 2
 ```
 
-**What to monitor:**
-- `rho(A)` should converge from 0.85 toward 0.7-0.95 (stable recurrence)
-- Loss should decrease steadily within 500-1000 steps
-- Halting distribution should spread across iterations (not all at loop 1)
+Healthy Phase 1 behavior:
 
-### Phase 2: Full Differential LR Fine-Tune
+- Loss drops quickly from the damaged-conversion baseline.
+- `rho(A)` stays below `1.0`, typically around `0.85-0.90`.
+- No NaNs, repeated loss spikes, or runaway gradient norms.
 
-Unfreezes all components with differentiated learning rates.
+### Phase 2: FineWeb-Edu Recovery
+
+Phase 2 starts from Phase 1 model weights, creates a fresh optimizer, and trains most non-norm parameters with differential learning rates.
 
 ```bash
 python training/qwen_recurrent_finetune.py \
   --phase full_differential \
-  --converted-ckpt converted_qwen3_4b_recurrent.pt \
-  --resume-checkpoints checkpoints/phase1 \
-  --steps 50000 \
-  --seq-len 2048 \
-  --micro-batch 4 \
-  --lr 3e-4 \
-  --warmup 2000 \
+  --converted-ckpt converted_qwen3_4b_recurrent_v3.pt \
+  --resume-checkpoints checkpoints/qwen_recurrent_phase1 \
+  --resume-model-only \
+  --steps 5000 \
+  --seq-len 512 \
+  --micro-batch 1 \
+  --grad-accum 4 \
+  --lr 3e-5 \
+  --warmup 200 \
   --dataset HuggingFaceFW/fineweb-edu \
   --dataset-config sample-10BT \
-  --ckpt-dir checkpoints/phase2
+  --ckpt-dir checkpoints/qwen_recurrent_phase2 \
+  --ckpt-every 1000 \
+  --log-every 10 \
+  --num-workers 2
 ```
 
-**Learning rate groups:**
+The `--resume-model-only` flag is important when moving from Phase 1 to Phase 2: the Phase 1 optimizer only contains recurrent-module parameters, while Phase 2 uses different optimizer groups.
 
-| Parameter Group | LR | Weight Decay | Why |
-|---|---|---|---|
-| Recurrent modules (injection/act/lora/norm) | 5e-5 | 0.01 | Random init, need full adaptation |
-| Prelude + Coda blocks | 1e-5 | 0.05 | Averaged from 2 layers, moderate adjustment |
-| Recurrent transformer block | 5e-6 | 0.05 | Averaged from 28 layers, most fragile |
-| Embedding/head | 1e-5 | 0.0 | Token representation, no decay |
-| All RMSNorm weights | frozen | — | Norms are sensitive to perturbation |
+Learning-rate groups in Phase 2:
 
-## Multi-GPU (FSDP)
-
-```bash
-torchrun --nproc_per_node=8 \
-  training/qwen_recurrent_finetune.py \
-  --phase full_differential \
-  --converted-ckpt converted_qwen3_4b_recurrent.pt \
-  --steps 50000 \
-  --seq-len 2048 \
-  --micro-batch 8
-```
-
-FSDP is automatically enabled when launched via `torchrun` (detects `RANK` env var). Uses `FULL_SHARD` with bf16/fp16 mixed precision.
+| Group | LR multiplier | Params | Purpose |
+|---|---:|---:|---|
+| Recurrent modules | `1.00x` | ~25.7M | Adapt LTI, ACT, recurrent norm, and projection LoRAs |
+| Prelude + coda blocks | `0.33x` | ~807M | Lightly adapt copied boundary blocks |
+| Recurrent Qwen blocks | `0.17x` | ~404M | Conservatively adapt reused L4-L7 blocks |
+| Embedding/head | `0.33x` | ~389M | Keep token space aligned |
+| RMSNorm weights | frozen | - | Avoid norm destabilization |
 
 ## CLI Arguments
 
 | Argument | Default | Description |
 |---|---|---|
 | `--phase` | `recurrent_only` | `recurrent_only` or `full_differential` |
-| `--converted-ckpt` | required | Path to converted checkpoint |
-| `--resume-checkpoints` | none | Directory to resume latest checkpoint from |
-| `--steps` | 15000 | Total training steps |
-| `--seq-len` | 1024 | Sequence length |
+| `--converted-ckpt` | required | Converted Qwen recurrent checkpoint |
+| `--resume-checkpoints` | none | Directory containing `step_*.pt` checkpoints |
+| `--resume-model-only` | false | Load model weights without optimizer state |
+| `--steps` | 15000 | Total optimizer steps |
+| `--seq-len` | 1024 | Training sequence length |
 | `--micro-batch` | 4 | Per-GPU micro batch size |
-| `--lr` | 1e-4 | Base learning rate (scaled per group in Phase 2) |
+| `--grad-accum` | auto | Gradient accumulation steps |
+| `--lr` | `1e-4` | Base learning rate |
 | `--warmup` | 500 | Warmup steps |
 | `--weight-decay` | 0.05 | Weight decay |
 | `--grad-clip` | 1.0 | Gradient clipping norm |
-| `--dataset` | `roneneldan/TinyStories` | HF dataset name |
-| `--dataset-config` | none | HF dataset config name (e.g. `sample-10BT`) |
-| `--ckpt-dir` | `checkpoints` | Checkpoint directory |
-| `--ckpt-every` | 2000 | Save checkpoint every N steps |
+| `--dataset` | `roneneldan/TinyStories` | Hugging Face dataset name |
+| `--dataset-config` | none | Hugging Face dataset config, such as `sample-10BT` |
+| `--ckpt-dir` | `checkpoints` | Checkpoint output directory |
+| `--ckpt-every` | 2000 | Save every N steps |
 | `--log-every` | 10 | Log every N steps |
+| `--num-workers` | 4 | DataLoader worker count |
+| `--tokenizer` | `Qwen/Qwen3-4B` | Tokenizer repo or local tokenizer path |
 
-## Dataset Recommendations
+## Hardware Notes
 
-For coherence restoration (small data, fast iteration):
+Full differential checkpoints include optimizer state and are large. A single Phase 2 checkpoint for this model is roughly 19GB. Use a conservative checkpoint cadence, for example every 1000 steps, unless disk space is abundant.
 
-| Dataset | HF Name | Size | Notes |
-|---|---|---|---|
-| TinyStories | `roneneldan/TinyStories` | ~2M stories | Simple language, good for loop smoke-test |
-| FineWeb-Edu 10BT | `HuggingFaceFW/fineweb-edu` (config: `sample-10BT`) | 10B tokens | High-quality web text, good balance |
-| Dolmino-100B | `datalab-all/dolmino-gguf-100b` | 100B tokens | Very clean, for serious fine-tuning |
+| Hardware | Suggested settings |
+|---|---|
+| 32GB VRAM | `seq_len=512`, `micro_batch=1`, `grad_accum=4` |
+| 40GB VRAM | `seq_len=1024`, `micro_batch=1-2` |
+| 80GB VRAM | `seq_len=2048+`, larger micro batches |
+| Multi-GPU FSDP | Use `torchrun`; FSDP activates when `RANK` is present |
 
-## Hardware Requirements
+## Validation
 
-| GPU VRAM | Feasible? | Notes |
-|---|---|---|
-| < 24GB | No | Model weights alone are ~1.8GB fp16, gradients + optimizer state need ~6x that |
-| 24GB (RTX 4090) | Yes | seq_len=512-1024, micro_batch=2-4, grad_accum=16 |
-| 40GB (A100) | Yes | seq_len=2048, micro_batch=8, grad_accum=8 |
-| 80GB (A100/H100) | Comfortable | seq_len=4096, micro_batch=16, grad_accum=4 |
-| 8x 80GB | Ideal | Full FSDP, seq_len=4096, large global batch |
-
-## Validation After Fine-Tuning
+Validate checkpoint integrity and run optional generation:
 
 ```bash
 python scripts/validate_qwen_recurrent.py \
-  --checkpoint checkpoints/phase2/step_050000.pt \
+  --checkpoint checkpoints/qwen_recurrent_phase2/step_0005000.pt \
   --generate \
   --prompts "Once upon a time" "def fibonacci(n):" "The capital of France is"
 ```
 
-Expected output progression:
-- **Before fine-tune:** Gibberish, no coherent patterns
-- **After Phase 1:** Some repetitive patterns, better token distribution
-- **After Phase 2:** Coherent sentences, grammatically correct text
+Expected progression:
+
+- **Converted checkpoint:** structurally valid, but may show conversion damage.
+- **After Phase 1:** much better token distribution and basic coherence.
+- **After Phase 2:** more Qwen-like general text behavior, with the recurrent topology healed enough for longer recovery runs.
 
 ## Stability Checklist
 
-During training, monitor these in the logs:
+Monitor these in the logs:
 
-1. **`rho(A)` < 1.0** — LTI spectral radius must stay under 1.0 at all times
-2. **`rho(A)` > 0.3** — If A collapses toward 0, the recurrence is dead
-3. **Halting spread** — Tokens should halt across multiple loop iterations, not all at once
-4. **Loss monotonicity** — Loss should trend downward; spikes > 3x indicate instability
-5. **Gradient norm** — Should be 0.1-5.0; > 10.0 suggests LR is too high
+1. `rho(A) < 1.0`: the recurrent carry path must remain contractive.
+2. `rho(A) > 0.3`: very low retention means the recurrence is effectively dead.
+3. Loss should trend down over hundreds of steps; short-term noise is normal.
+4. Repeated loss spikes above 3x the running average usually mean the LR is too high.
+5. Gradient norms should settle after warmup; persistent large values suggest reducing LR or freezing more backbone parameters.

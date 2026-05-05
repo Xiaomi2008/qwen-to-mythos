@@ -2,8 +2,8 @@
 Validate the converted QwenRecurrentModel checkpoint.
 
 Usage:
-    python scripts/validate_qwen_recurrent.py --checkpoint converted_qwen3_4b_recurrent.pt
-    python scripts/validate_qwen_recurrent.py --checkpoint converted_qwen3_4b_recurrent.pt --generate --prompts "Hello world" "def fibonacci("
+    python scripts/validate_qwen_recurrent.py --checkpoint converted_qwen3_4b_recurrent_v2.pt
+    python scripts/validate_qwen_recurrent.py --checkpoint converted_qwen3_4b_recurrent_v2.pt --generate --prompts "Hello world" "def fibonacci("
 """
 
 import argparse

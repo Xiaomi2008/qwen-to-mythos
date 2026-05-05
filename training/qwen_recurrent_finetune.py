@@ -2,20 +2,20 @@
 """
 QwenRecurrentModel fine-tuning with two-phase differential learning rates.
 
-Phase 1 (recurrent_only): Trains only LTI/ACT/LoRA modules while freezing
-the Qwen backbone. Stabilizes the recurrent dynamics before touching averaged
-weights.
+Phase 1 (recurrent_only): Trains only LTI/ACT/projection-LoRA modules while
+freezing the Qwen backbone. Stabilizes recurrent dynamics before touching the
+verbatim copied Qwen blocks.
 
 Phase 2 (full_differential): Unfreezes all components with differentiated
-learning rates — higher for recurrent modules, lower for averaged blocks.
+learning rates — higher for recurrent modules, lower for copied Qwen blocks.
 
 Single GPU:
     python training/qwen_recurrent_finetune.py --phase recurrent_only \\
-        --converted-ckpt converted_qwen3_4b_recurrent.pt
+        --converted-ckpt converted_qwen3_4b_recurrent_v2.pt
 
 Multi-GPU (FSDP):
     torchrun --nproc_per_node=8 training/qwen_recurrent_finetune.py \\
-        --phase full_differential --converted-ckpt converted_qwen3_4b_recurrent.pt
+        --phase full_differential --converted-ckpt converted_qwen3_4b_recurrent_v2.pt
 """
 
 import argparse
@@ -127,7 +127,13 @@ def save_checkpoint(
     logger.success(f"Checkpoint saved -> {final_path}")
 
 
-def load_checkpoint(model, optimizer, path: str, ddp: bool) -> int:
+def load_checkpoint(
+    model,
+    optimizer,
+    path: str,
+    ddp: bool,
+    load_optimizer: bool = True,
+) -> int:
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
 
     if ddp:
@@ -137,15 +143,17 @@ def load_checkpoint(model, optimizer, path: str, ddp: bool) -> int:
             FullStateDictConfig(offload_to_cpu=True, rank0_only=False),
         ):
             model.load_state_dict(ckpt["model"])
-            optim_state = FSDP.optim_state_dict_to_load(
-                model=model,
-                optim=optimizer,
-                optim_state_dict=ckpt["optimizer"],
-            )
-            optimizer.load_state_dict(optim_state)
+            if load_optimizer:
+                optim_state = FSDP.optim_state_dict_to_load(
+                    model=model,
+                    optim=optimizer,
+                    optim_state_dict=ckpt["optimizer"],
+                )
+                optimizer.load_state_dict(optim_state)
     else:
         model.load_state_dict(ckpt["model"])
-        optimizer.load_state_dict(ckpt["optimizer"])
+        if load_optimizer:
+            optimizer.load_state_dict(ckpt["optimizer"])
 
     return int(ckpt["step"])
 
@@ -160,13 +168,15 @@ def build_param_groups(model: QwenRecurrentModel, phase: str, base_lr: float, wd
     Build optimizer parameter groups with differential learning rates.
 
     Phase "recurrent_only":
-        - Trainable: recurrent.injection, recurrent.act, recurrent.lora, recurrent.norm
-        - Frozen: all transformer blocks, embedding, head, other norms
+        - Trainable: recurrent.injection, recurrent.act, recurrent projection LoRAs,
+          recurrent.norm
+        - Frozen: all transformer blocks (including the K recurrent blocks),
+          embedding, head, other norms
 
     Phase "full_differential":
-        - Recurrent modules: lr=base_lr (highest)
+        - Recurrent modules (LTI/ACT/projection LoRAs/norm): lr=base_lr (highest)
         - Prelude + Coda blocks: lr=base_lr * 0.33
-        - Recurrent transformer block: lr=base_lr * 0.17
+        - Recurrent block stack (K blocks): lr=base_lr * 0.17
         - Embedding/head: lr=base_lr * 0.33
         - All RMSNorm weights: frozen
     """
@@ -175,14 +185,16 @@ def build_param_groups(model: QwenRecurrentModel, phase: str, base_lr: float, wd
         for name, param in model.named_parameters():
             param.requires_grad = False
 
-        # Unfreeze recurrent modules only
+        # Unfreeze recurrent modules only.
         for module in [
             model.recurrent.injection,
             model.recurrent.act,
-            model.recurrent.lora,
             model.recurrent.norm,
         ]:
             for param in module.parameters():
+                param.requires_grad = True
+        for name, param in model.recurrent.blocks.named_parameters():
+            if name.endswith("lora_a") or name.endswith("lora_b"):
                 param.requires_grad = True
 
         trainable = [p for p in model.parameters() if p.requires_grad]
@@ -190,7 +202,14 @@ def build_param_groups(model: QwenRecurrentModel, phase: str, base_lr: float, wd
             f"Phase=recurrent_only: {len(trainable)} trainable param tensors, "
             f"{sum(p.numel() for p in trainable):,} params, lr={base_lr}"
         )
-        return [{"params": trainable, "lr": base_lr, "weight_decay": wd}]
+        return [
+            {
+                "params": trainable,
+                "lr": base_lr,
+                "initial_lr": base_lr,
+                "weight_decay": wd,
+            }
+        ]
 
     elif phase == "full_differential":
         # Collect params by category
@@ -198,10 +217,12 @@ def build_param_groups(model: QwenRecurrentModel, phase: str, base_lr: float, wd
         for module in [
             model.recurrent.injection,
             model.recurrent.act,
-            model.recurrent.lora,
             model.recurrent.norm,
         ]:
             recurrent_module_params.extend(module.parameters())
+        for name, param in model.recurrent.blocks.named_parameters():
+            if name.endswith("lora_a") or name.endswith("lora_b"):
+                recurrent_module_params.append(param)
 
         prelude_coda_params = []
         for block in model.prelude:
@@ -213,11 +234,12 @@ def build_param_groups(model: QwenRecurrentModel, phase: str, base_lr: float, wd
                 if "norm" not in n:
                     prelude_coda_params.append(p)
 
-        recurrent_block_params = [
-            p
-            for n, p in model.recurrent.block.named_parameters()
-            if "norm" not in n
-        ]
+        # Recurrent block stack (K blocks, each a QwenTransformerBlock)
+        recurrent_block_params = []
+        for block in model.recurrent.blocks:
+            for n, p in block.named_parameters():
+                if "norm" not in n and not n.endswith(("lora_a", "lora_b")):
+                    recurrent_block_params.append(p)
 
         # Embedding/head (tied, same weight)
         embed_params = [model.embed.weight]
@@ -231,21 +253,25 @@ def build_param_groups(model: QwenRecurrentModel, phase: str, base_lr: float, wd
             {
                 "params": recurrent_module_params,
                 "lr": base_lr,
+                "initial_lr": base_lr,
                 "weight_decay": 0.01,
             },
             {
                 "params": prelude_coda_params,
                 "lr": base_lr * 0.33,
+                "initial_lr": base_lr * 0.33,
                 "weight_decay": wd,
             },
             {
                 "params": recurrent_block_params,
                 "lr": base_lr * 0.17,
+                "initial_lr": base_lr * 0.17,
                 "weight_decay": wd,
             },
             {
                 "params": embed_params,
                 "lr": base_lr * 0.33,
+                "initial_lr": base_lr * 0.33,
                 "weight_decay": 0.0,
             },
         ]
@@ -301,9 +327,20 @@ def main():
     )
     parser.add_argument("--converted-ckpt", required=True, help="Path to converted checkpoint")
     parser.add_argument("--resume-checkpoints", default=None, help="Dir to resume latest ckpt from")
+    parser.add_argument(
+        "--resume-model-only",
+        action="store_true",
+        help="Load only model weights from resume checkpoint and start a fresh optimizer/schedule",
+    )
     parser.add_argument("--steps", type=int, default=15000, help="Total training steps")
     parser.add_argument("--seq-len", type=int, default=1024, help="Sequence length")
     parser.add_argument("--micro-batch", type=int, default=4, help="Per-GPU micro batch size")
+    parser.add_argument(
+        "--grad-accum",
+        type=int,
+        default=None,
+        help="Gradient accumulation steps (default: target ~256 samples/global batch)",
+    )
     parser.add_argument("--lr", type=float, default=1e-4, help="Base learning rate")
     parser.add_argument("--warmup", type=int, default=500, help="Warmup steps")
     parser.add_argument("--weight-decay", type=float, default=0.05, help="Weight decay")
@@ -321,6 +358,7 @@ def main():
     parser.add_argument("--ckpt-dir", default="checkpoints", help="Checkpoint directory")
     parser.add_argument("--ckpt-every", type=int, default=2000, help="Save every N steps")
     parser.add_argument("--log-every", type=int, default=10, help="Log every N steps")
+    parser.add_argument("--num-workers", type=int, default=4, help="DataLoader workers")
     parser.add_argument(
         "--tokenizer",
         default="Qwen/Qwen3-4B",
@@ -363,15 +401,17 @@ def main():
         tokenizer_name=args.tokenizer,
         dataset_config=args.dataset_config,
     )
-    vocab_size = dataset.vocab_size
-
     if master:
-        logger.info(f"Tokenizer: {args.tokenizer}  |  Vocab size: {vocab_size:,}")
+        logger.info(f"Tokenizer: {args.tokenizer}  |  Tokenizer size: {dataset.vocab_size:,}")
 
     # ------------------------------------------------------------------
     # Hyperparameters
     # ------------------------------------------------------------------
-    grad_accum = max(1, 256 // (world_size * args.micro_batch))
+    grad_accum = (
+        args.grad_accum
+        if args.grad_accum is not None
+        else max(1, 256 // (world_size * args.micro_batch))
+    )
     global_batch_tok = world_size * args.micro_batch * grad_accum * args.seq_len
 
     if master:
@@ -385,8 +425,7 @@ def main():
     # Model
     # ------------------------------------------------------------------
     cfg = QwenRecurrentConfig()
-    cfg.vocab_size = vocab_size
-    cfg.max_seq_len = args.seq_len
+    vocab_size = cfg.vocab_size
 
     model = QwenRecurrentModel(cfg)
 
@@ -450,15 +489,30 @@ def main():
         latest = existing_ckpts[-1]
         if master:
             logger.info(f"Resuming from checkpoint: {latest}")
-        start_step = load_checkpoint(model, optimizer, latest, ddp)
+        loaded_step = load_checkpoint(
+            model,
+            optimizer,
+            latest,
+            ddp,
+            load_optimizer=not args.resume_model_only,
+        )
+        start_step = 0 if args.resume_model_only else loaded_step
         if master:
-            logger.success(f"Resumed at step {start_step}")
+            if args.resume_model_only:
+                logger.success(
+                    f"Loaded model weights from step {loaded_step}; starting fresh at step 0"
+                )
+            else:
+                logger.success(f"Resumed at step {start_step}")
 
     # ------------------------------------------------------------------
     # DataLoader
     # ------------------------------------------------------------------
     loader = DataLoader(
-        dataset, batch_size=args.micro_batch, num_workers=4, pin_memory=True
+        dataset,
+        batch_size=args.micro_batch,
+        num_workers=args.num_workers,
+        pin_memory=True,
     )
 
     # ------------------------------------------------------------------
@@ -503,7 +557,7 @@ def main():
             with sync, amp_ctx:
                 logits = model(x)
                 loss = nn.functional.cross_entropy(
-                    logits.view(-1, vocab_size), y.view(-1)
+                    logits.view(-1, logits.size(-1)), y.view(-1)
                 )
                 loss = loss / grad_accum
 

@@ -53,7 +53,7 @@ class QwenStreamingDataset(IterableDataset):
     def __iter__(self):
         worker = get_worker_info()
         num_workers = worker.num_workers if worker else 1
-        worker_id = worker.id if worker else 1
+        worker_id = worker.id if worker else 0
 
         total_shards = self.world_size * num_workers
         shard_index = self.rank * num_workers + worker_id

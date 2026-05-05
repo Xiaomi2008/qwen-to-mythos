@@ -229,6 +229,7 @@ class GQAttention(nn.Module):
             Output tensor of shape (B, T, dim)
         """
         B, T, _ = x.shape
+        freqs_cis = freqs_cis[:T]
         q = self.wq(x).view(B, T, self.n_heads, self.head_dim)
         k = self.wk(x).view(B, T, self.n_kv_heads, self.head_dim)
         v = self.wv(x).view(B, T, self.n_kv_heads, self.head_dim)
@@ -367,6 +368,7 @@ class MLAttention(nn.Module):
             Output tensor of shape (B, T, dim)
         """
         B, T, _ = x.shape
+        freqs_cis = freqs_cis[:T]
 
         # Q
         c_q = self.q_norm(self.q_down(x))
@@ -722,7 +724,9 @@ class LTIInjection(nn.Module):
         # Compute in log space to avoid 0 * inf = NaN when log_dt → -∞, log_A → +∞.
         # dt * A_c = -exp(log_dt) * exp(log_A) = -exp(log_dt + log_A)
         # Clamp keeps the product finite in float32 for any gradient step size.
-        return torch.exp(-torch.exp((self.log_dt + self.log_A).clamp(-20, 20)))
+        # The lower bound must not be too negative, or exp(-exp(x)) rounds to
+        # exactly 1.0 in float32 and breaks the strict ρ(A) < 1 invariant.
+        return torch.exp(-torch.exp((self.log_dt + self.log_A).clamp(-15, 20)))
 
     def forward(
         self, h: torch.Tensor, e: torch.Tensor, transformer_out: torch.Tensor

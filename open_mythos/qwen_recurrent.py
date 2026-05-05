@@ -17,7 +17,6 @@ import torch.nn as nn
 
 from open_mythos.main import (
     ACTHalting,
-    LoRAAdapter,
     LTIInjection,
     RMSNorm,
     apply_rope,
@@ -28,7 +27,18 @@ from open_mythos.main import (
 
 @dataclass
 class QwenRecurrentConfig:
-    """Configuration for the QwenRecurrentModel, mirroring Qwen3-4B."""
+    """Configuration for the QwenRecurrentModel, mirroring Qwen3-4B.
+
+    Layer assignment uses **verbatim copy** of contiguous Qwen layers:
+        prelude  ← Qwen [0 .. prelude_layers - 1]                         (4 blocks: L0-L3)
+        recurrent ← Qwen [prelude_layers .. prelude_layers + K - 1]        (4 blocks: L4-L7)
+                   stacked into a K-block ModuleList, looped T times
+        coda     ← Qwen [n_layers - coda_layers .. n_layers - 1]          (4 blocks: L32-L35)
+
+    The alignment K · max_loop_iters = n_layers - prelude_layers - coda_layers
+    (i.e. 4 · 7 = 28) makes a forward pass with n_loops=1 traverse exactly the
+    contiguous Qwen subnet L0-L3 → L4-L7 → L32-L35 — coherent at init.
+    """
 
     # Qwen3-4B native dimensions
     vocab_size: int = 151936
@@ -46,39 +56,84 @@ class QwenRecurrentConfig:
     # Normalization
     rms_norm_eps: float = 1e-6
 
-    # Mythos structural choices
-    prelude_layers: int = 2
-    coda_layers: int = 2
-    # Qwen L0-L3 → prelude (2 blocks, averaged pairs)
-    # Qwen L4-L31 → recurrent (1 block, averaged 28 layers)
-    # Qwen L32-L35 → coda (2 blocks, averaged pairs)
+    # Mythos structural choices — K=4 contiguous, T=7
+    prelude_layers: int = 4
+    coda_layers: int = 4
+    n_recurrent_layers: int = 4
 
     # Recurrent loop
-    max_loop_iters: int = 16
+    max_loop_iters: int = 7
     act_threshold: float = 0.99
     loop_dim: int = 320  # dim // 8, channels for loop-index embedding
 
-    # LoRA depth adaptation
+    # LoRA depth adaptation (one LoRA per recurrent block, indexed by loop)
     lora_rank: int = 16
 
     # Dropout
     dropout: float = 0.0
 
-    # Layer grouping (derived, for clarity)
+    # Layer mapping helpers — Qwen layers copied into each Mythos slot
     @property
-    def prelude_layer_range(self) -> range:
-        return range(0, self.prelude_layers * 2)
+    def prelude_qwen_layers(self) -> list[int]:
+        return list(range(0, self.prelude_layers))
 
     @property
-    def recurrent_layer_range(self) -> range:
-        start = self.prelude_layers * 2
-        end = self.n_layers - self.coda_layers * 2
-        return range(start, end)
+    def recurrent_base_qwen_layers(self) -> list[int]:
+        start = self.prelude_layers
+        return list(range(start, start + self.n_recurrent_layers))
 
     @property
-    def coda_layer_range(self) -> range:
-        start = self.n_layers - self.coda_layers * 2
-        return range(start, self.n_layers)
+    def coda_qwen_layers(self) -> list[int]:
+        return list(range(self.n_layers - self.coda_layers, self.n_layers))
+
+    def loop_target_qwen_layer(self, loop_t: int, block_k: int) -> int:
+        """For loop iteration t and recurrent block k, the Qwen layer this
+        position would correspond to in a fully unrolled forward pass."""
+        return self.prelude_layers + loop_t * self.n_recurrent_layers + block_k
+
+
+class LoopwiseLoRALinear(nn.Module):
+    """
+    Bias-free linear layer with optional per-loop low-rank weight deltas.
+
+    The base weight is copied verbatim from one Qwen layer. For recurrent
+    blocks, each loop index can add a rank-r delta initialized from the SVD of
+    target_weight - base_weight, so loop t/block k approximates the matching
+    original Qwen layer without giving up recurrent weight tying.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        rank: int,
+        max_loops: int,
+        enable_lora: bool = False,
+    ):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.rank = rank
+        self.max_loops = max_loops
+        self.enable_lora = enable_lora
+
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        if enable_lora:
+            self.lora_a = nn.Parameter(torch.zeros(max_loops, rank, in_features))
+            self.lora_b = nn.Parameter(torch.zeros(max_loops, out_features, rank))
+        else:
+            self.register_parameter("lora_a", None)
+            self.register_parameter("lora_b", None)
+
+    def forward(self, x: torch.Tensor, loop_t: Optional[int] = None) -> torch.Tensor:
+        out = torch.nn.functional.linear(x, self.weight)
+        if not self.enable_lora or loop_t is None:
+            return out
+
+        max_t = self.max_loops - 1
+        t_idx = loop_t if loop_t <= max_t else max_t
+        down = torch.nn.functional.linear(x, self.lora_a[t_idx])
+        return out + torch.nn.functional.linear(down, self.lora_b[t_idx])
 
 
 class QwenAttention(nn.Module):
@@ -92,7 +147,7 @@ class QwenAttention(nn.Module):
     Preserves Qwen's weight layout so we can load checkpoint weights directly.
     """
 
-    def __init__(self, cfg: QwenRecurrentConfig):
+    def __init__(self, cfg: QwenRecurrentConfig, enable_loop_lora: bool = False):
         super().__init__()
         self.n_heads = cfg.n_heads
         self.n_kv_heads = cfg.n_kv_heads
@@ -101,10 +156,34 @@ class QwenAttention(nn.Module):
         self.dropout_p = cfg.dropout
 
         # Qwen naming convention (shapes match checkpoint exactly)
-        self.q_proj = nn.Linear(cfg.dim, cfg.n_heads * cfg.head_dim, bias=False)
-        self.k_proj = nn.Linear(cfg.dim, cfg.n_kv_heads * cfg.head_dim, bias=False)
-        self.v_proj = nn.Linear(cfg.dim, cfg.n_kv_heads * cfg.head_dim, bias=False)
-        self.o_proj = nn.Linear(cfg.n_heads * cfg.head_dim, cfg.dim, bias=False)
+        self.q_proj = LoopwiseLoRALinear(
+            cfg.dim,
+            cfg.n_heads * cfg.head_dim,
+            cfg.lora_rank,
+            cfg.max_loop_iters,
+            enable_loop_lora,
+        )
+        self.k_proj = LoopwiseLoRALinear(
+            cfg.dim,
+            cfg.n_kv_heads * cfg.head_dim,
+            cfg.lora_rank,
+            cfg.max_loop_iters,
+            enable_loop_lora,
+        )
+        self.v_proj = LoopwiseLoRALinear(
+            cfg.dim,
+            cfg.n_kv_heads * cfg.head_dim,
+            cfg.lora_rank,
+            cfg.max_loop_iters,
+            enable_loop_lora,
+        )
+        self.o_proj = LoopwiseLoRALinear(
+            cfg.n_heads * cfg.head_dim,
+            cfg.dim,
+            cfg.lora_rank,
+            cfg.max_loop_iters,
+            enable_loop_lora,
+        )
 
         # Per-head RMSNorm on Q and K (Qwen3-specific)
         self.q_norm = RMSNorm(cfg.head_dim, eps=cfg.rms_norm_eps)
@@ -117,11 +196,12 @@ class QwenAttention(nn.Module):
         mask: Optional[torch.Tensor] = None,
         kv_cache: Optional[dict] = None,
         cache_key: str = "default",
+        loop_t: Optional[int] = None,
     ) -> torch.Tensor:
         B, T, _ = x.shape
-        q = self.q_proj(x).view(B, T, self.n_heads, self.head_dim)
-        k = self.k_proj(x).view(B, T, self.n_kv_heads, self.head_dim)
-        v = self.v_proj(x).view(B, T, self.n_kv_heads, self.head_dim)
+        q = self.q_proj(x, loop_t).view(B, T, self.n_heads, self.head_dim)
+        k = self.k_proj(x, loop_t).view(B, T, self.n_kv_heads, self.head_dim)
+        v = self.v_proj(x, loop_t).view(B, T, self.n_kv_heads, self.head_dim)
 
         # Per-head RMSNorm before RoPE (Qwen3 order)
         q = self.q_norm(q)
@@ -158,7 +238,7 @@ class QwenAttention(nn.Module):
         out = torch.matmul(attn, v.float())
         out = out.to(orig_dtype)
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
-        return self.o_proj(out)
+        return self.o_proj(out, loop_t)
 
 
 class QwenFFN(nn.Module):
@@ -168,15 +248,35 @@ class QwenFFN(nn.Module):
     output = down(silu(gate(x)) * up(x))
     """
 
-    def __init__(self, cfg: QwenRecurrentConfig):
+    def __init__(self, cfg: QwenRecurrentConfig, enable_loop_lora: bool = False):
         super().__init__()
-        self.gate_proj = nn.Linear(cfg.dim, cfg.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(cfg.dim, cfg.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(cfg.intermediate_size, cfg.dim, bias=False)
+        self.gate_proj = LoopwiseLoRALinear(
+            cfg.dim,
+            cfg.intermediate_size,
+            cfg.lora_rank,
+            cfg.max_loop_iters,
+            enable_loop_lora,
+        )
+        self.up_proj = LoopwiseLoRALinear(
+            cfg.dim,
+            cfg.intermediate_size,
+            cfg.lora_rank,
+            cfg.max_loop_iters,
+            enable_loop_lora,
+        )
+        self.down_proj = LoopwiseLoRALinear(
+            cfg.intermediate_size,
+            cfg.dim,
+            cfg.lora_rank,
+            cfg.max_loop_iters,
+            enable_loop_lora,
+        )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, loop_t: Optional[int] = None) -> torch.Tensor:
         return self.down_proj(
-            torch.nn.functional.silu(self.gate_proj(x)) * self.up_proj(x)
+            torch.nn.functional.silu(self.gate_proj(x, loop_t))
+            * self.up_proj(x, loop_t),
+            loop_t,
         )
 
 
@@ -189,12 +289,12 @@ class QwenTransformerBlock(nn.Module):
         x = x + FFN(RMSNorm(x))
     """
 
-    def __init__(self, cfg: QwenRecurrentConfig):
+    def __init__(self, cfg: QwenRecurrentConfig, enable_loop_lora: bool = False):
         super().__init__()
         self.input_layernorm = RMSNorm(cfg.dim, eps=cfg.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(cfg.dim, eps=cfg.rms_norm_eps)
-        self.self_attn = QwenAttention(cfg)
-        self.mlp = QwenFFN(cfg)
+        self.self_attn = QwenAttention(cfg, enable_loop_lora)
+        self.mlp = QwenFFN(cfg, enable_loop_lora)
 
     def forward(
         self,
@@ -203,30 +303,44 @@ class QwenTransformerBlock(nn.Module):
         mask: Optional[torch.Tensor] = None,
         kv_cache: Optional[dict] = None,
         cache_key: str = "default",
+        loop_t: Optional[int] = None,
     ) -> torch.Tensor:
         x = x + self.self_attn(
-            self.input_layernorm(x), freqs_cis, mask, kv_cache, cache_key
+            self.input_layernorm(x), freqs_cis, mask, kv_cache, cache_key, loop_t
         )
-        x = x + self.mlp(self.post_attention_layernorm(x))
+        x = x + self.mlp(self.post_attention_layernorm(x), loop_t)
         return x
 
 
 class QwenRecurrentBlock(nn.Module):
     """
-    The recurrent block — one QwenTransformerBlock looped T times with:
+    The recurrent block — a stack of K=cfg.n_recurrent_layers QwenTransformerBlocks
+    looped T times with:
     - Loop-index embedding (positional signal for recurrence depth)
     - LTI-stable injection (A·h + B·e + transformer_out)
     - ACT halting (adaptive per-position early exit)
-    - LoRA depth adapter (per-loop parameter variation)
+    - Per-loop low-rank deltas inside each block projection
+
+    Per loop iteration t:
+        h_loop = loop_index_embedding(h, t)
+        out = norm(h_loop + e)
+        for k in 0..K-1:
+            out = blocks[k](out, loop_t=t)
+        h = injection(h, e, out)
+        ACT halting
     """
 
     def __init__(self, cfg: QwenRecurrentConfig):
         super().__init__()
         self.cfg = cfg
-        self.block = QwenTransformerBlock(cfg)
+        self.blocks = nn.ModuleList(
+            [
+                QwenTransformerBlock(cfg, enable_loop_lora=True)
+                for _ in range(cfg.n_recurrent_layers)
+            ]
+        )
         self.injection = LTIInjection(cfg.dim)
         self.act = ACTHalting(cfg.dim)
-        self.lora = LoRAAdapter(cfg.dim, cfg.lora_rank, cfg.max_loop_iters)
         self.norm = RMSNorm(cfg.dim, eps=cfg.rms_norm_eps)
 
     def forward(
@@ -248,13 +362,13 @@ class QwenRecurrentBlock(nn.Module):
 
         for t in range(n_loops):
             h_loop = loop_index_embedding(h, t, loop_dim)
-            combined = self.norm(h_loop + e)
-            cache_key = f"recurrent_loop_{t}"
+            out = self.norm(h_loop + e)
 
-            trans_out = self.block(combined, freqs_cis, mask, kv_cache, cache_key)
-            trans_out = trans_out + self.lora(trans_out, t)
+            for k, block in enumerate(self.blocks):
+                cache_key = f"recurrent_loop_{t}_block_{k}"
+                out = block(out, freqs_cis, mask, kv_cache, cache_key, loop_t=t)
 
-            h = self.injection(h, e, trans_out)
+            h = self.injection(h, e, out)
 
             p = self.act(h)
             still_running = ~halted
@@ -281,24 +395,29 @@ class QwenRecurrentModel(nn.Module):
     """
     Qwen3-4B restructured as a Recurrent-Depth Transformer.
 
-    Topology:
+    Topology (verbatim contiguous Qwen layers, no averaging):
         Input tokens
          ↓
-        [Prelude]       — 2 Qwen transformer blocks (averaged from L0-L3)
+        [Prelude]       — 4 Qwen transformer blocks copied from L0-L3
          ↓
-        [Recurrent]     — 1 Qwen transformer block looped T times
-                          (averaged from L4-L31, with LTI/ACT/LoRA)
-         ↑_______↓      h_{t+1} = A·h_t + B·e + Block(h_t, e)
+        [Recurrent]     — K=4 stacked Qwen transformer blocks copied from
+                          L4-L7, looped T=7 times (with LTI/ACT/projection LoRA)
+         ↑_______↓      h_{t+1} = A·h_t + B·e + Block_K(...Block_1(h_t, e))
          ↓
-        [Coda]          — 2 Qwen transformer blocks (averaged from L32-L35)
+        [Coda]          — 4 Qwen transformer blocks copied from L32-L35
          ↓
         Output logits
 
     Properties:
     - Keeps Qwen3-4B's dim (2560), GQA (32/8 heads, head_dim=128),
       SwiGLU FFN (9728), vocab (151k), q_norm/k_norm
-    - 36 unique layers → 6 unique layers (6x weight reuse in loop)
-    - Same parameters, more loops → deeper reasoning
+    - 36 Qwen layers → 12 unique blocks (4 prelude + 4 recurrent + 4 coda)
+      with 7x weight reuse on the recurrent block stack
+    - K · T = 28 = (n_layers - prelude - coda), so forward(x, n_loops=1)
+      traverses exactly the 12-layer Qwen subnet L0-L3 → L4-L7 → L32-L35,
+      giving a Qwen-coherent starting point at init
+    - Per-loop projection LoRAs are initialized to approximate the matching
+      Qwen L4-L31 layers during a full T=7 recurrent pass
     - ACT halting: variable compute per position
     - LTI-stable injection: spectral radius < 1 guaranteed
     """

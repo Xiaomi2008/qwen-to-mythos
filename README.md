@@ -168,6 +168,50 @@ Key design choices:
 
 ---
 
+## Qwen-to-Mythos Conversion
+
+This repository also includes a concrete Qwen3-4B transfer experiment: `QwenRecurrentModel` keeps Qwen's native dimensions, GQA attention, SwiGLU MLPs, tokenizer space, and tied embedding/head while restructuring the 36-layer stack into a recurrent-depth topology.
+
+The current conversion uses a contiguous coherent mapping:
+
+| Mythos stage | Qwen source | Behavior |
+|---|---:|---|
+| Prelude | L0-L3 | Copied verbatim and run once |
+| Recurrent stack | L4-L7 | Four Qwen blocks looped seven times |
+| Coda | L32-L35 | Copied verbatim and run once |
+
+The alignment condition is:
+
+```text
+P + K*T = N - E
+```
+
+For Qwen3-4B, `N=36`, `P=4`, `K=4`, `T=7`, and `E=4`, so the recurrent stack covers the 28 middle layers. Each recurrent projection also has a per-loop rank-`lora_rank` adapter initialized from the SVD of the matching Qwen layer delta. Loop 0 has zero LoRA delta, while loops 1-6 approximate Qwen L8-L31.
+
+Convert a checkpoint:
+
+```bash
+python scripts/convert_qwen_to_recurrent.py \
+  --qwen-path Qwen/Qwen3-4B \
+  --output converted_qwen3_4b_recurrent_v3.pt
+```
+
+Validate it:
+
+```bash
+python scripts/validate_qwen_recurrent.py \
+  --checkpoint converted_qwen3_4b_recurrent_v3.pt
+```
+
+Fine-tuning uses two phases:
+
+1. `recurrent_only`: trains only LTI, ACT, recurrent norm, and projection LoRAs while the copied Qwen backbone is frozen.
+2. `full_differential`: starts from Phase 1 model weights and trains most non-norm parameters with lower learning rates for copied Qwen blocks.
+
+See [`training/README.md`](training/README.md) for exact Phase 1 and FineWeb-Edu Phase 2 commands.
+
+---
+
 ## Documentation
 
 | Page | Description |

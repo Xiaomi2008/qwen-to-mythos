@@ -15,6 +15,14 @@ from open_mythos.main import (
     loop_index_embedding,
     precompute_rope_freqs,
 )
+from open_mythos.qwen_recurrent import (
+    QwenAttention,
+    QwenFFN,
+    QwenRecurrentBlock,
+    QwenRecurrentConfig,
+    QwenRecurrentModel,
+    QwenTransformerBlock,
+)
 from open_mythos.tokenizer import MythosTokenizer
 from open_mythos.variants import (
     mythos_1b,
@@ -42,6 +50,12 @@ __all__ = [
     "precompute_rope_freqs",
     "apply_rope",
     "loop_index_embedding",
+    "QwenRecurrentConfig",
+    "QwenAttention",
+    "QwenFFN",
+    "QwenTransformerBlock",
+    "QwenRecurrentBlock",
+    "QwenRecurrentModel",
     "mythos_1b",
     "mythos_3b",
     "mythos_10b",
